@@ -29,6 +29,59 @@ async function translateText(text, targetLang = 'it') {
     }
 }
 
+// --- ENTITY PRESERVATION ---
+function preserveOutgoingEntities(text) {
+    const map = [];
+    let tempText = text;
+    const regexes = [ /(https?:\/\/[^\s]+)/g, /<(@[!&]?|#)\d+>/g, /<a?:[a-zA-Z0-9_]+:\d+>/g ];
+    regexes.forEach(regex => {
+        tempText = tempText.replace(regex, (match) => {
+            map.push(match);
+            return ` __${map.length - 1}__ `;
+        });
+    });
+    return { tempText, map };
+}
+
+function extractIncomingAndMap(el) {
+    let map = [];
+    let textToTranslate = "";
+    function processNode(node) {
+        if (node.nodeType === Node.TEXT_NODE) {
+            textToTranslate += node.nodeValue;
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+            if (node.tagName === 'A' || (node.classList && node.classList.contains('mention')) || node.tagName === 'IMG' || (node.className && typeof node.className === 'string' && node.className.includes('emoji'))) {
+                map.push(node.outerHTML);
+                textToTranslate += ` __${map.length - 1}__ `;
+            } else {
+                node.childNodes.forEach(processNode);
+            }
+        }
+    }
+    processNode(el);
+    return { textToTranslate, map };
+}
+
+function restoreEntities(translatedText, map) {
+    let result = translatedText;
+    for (let i = 0; i < map.length; i++) {
+        const regex = new RegExp(`(?:_|\\\\s)*__(?:\\\\s)*${i}(?:\\\\s)*__(?:_|\\\\s)*`, 'g');
+        result = result.replace(regex, ` ${map[i]} `);
+    }
+    return result;
+}
+
+function getMatchKey(str) {
+    let cleaned = (str || '').toString()
+        .replace(/<@[!&]?\d+>/g, '')
+        .replace(/<#\d+>/g, '')
+        .replace(/<a?:[a-zA-Z0-9_]+:\d+>/g, '')
+        .replace(/https?:\/\/[^\s]+/g, '')
+        .replace(/@[^\s]+/g, '');
+    const alphaNum = cleaned.replace(/[^a-zA-Z0-9]/g, '');
+    return alphaNum.length >= 3 ? alphaNum : str.trim();
+}
+
 // Map to store Outgoing messages: Translated Output -> Original Input map
 window.discordlateSentTranslations = window.discordlateSentTranslations || new Map();
 window.discordlateEnableTranslation = true; // Toggle state
@@ -83,11 +136,15 @@ window.fetch = async function(...args) {
                     console.log("[Discordlate] Intercepted outgoing message:", originalItalianText);
                     
                     // Translate original -> target out before sending
-                    const englishText = await translateText(originalItalianText, window.discordlateLangOut);
+                    const { tempText, map } = preserveOutgoingEntities(originalItalianText);
+                    const englishTempText = await translateText(tempText, window.discordlateLangOut);
+                    const englishText = restoreEntities(englishTempText, map);
+                    
                     bodyJson.content = englishText;
                     options.body = JSON.stringify(bodyJson);
                     
-                    window.discordlateSentTranslations.set(englishText, originalItalianText);
+                    window.discordlateSentTranslations.set(getMatchKey(englishText), originalItalianText);
+                    window.discordlateSentTranslations.set(englishText, originalItalianText); // fallback
                     console.log(`[Discordlate] Transformed outgoing message -> "${englishText}"`);
                 }
             }
@@ -124,9 +181,12 @@ window.XMLHttpRequest = function() {
                         console.log("[Discordlate] Intercepted outgoing XHR message:", originalItalianText);
                         
                         // We must translate asynchronously, then call originalSend
-                        translateText(originalItalianText, window.discordlateLangOut).then(englishText => {
+                        const { tempText, map } = preserveOutgoingEntities(originalItalianText);
+                        translateText(tempText, window.discordlateLangOut).then(englishTempText => {
+                            const englishText = restoreEntities(englishTempText, map);
                             bodyJson.content = englishText;
-                            window.discordlateSentTranslations.set(englishText, originalItalianText);
+                            window.discordlateSentTranslations.set(getMatchKey(englishText), originalItalianText);
+                            window.discordlateSentTranslations.set(englishText, originalItalianText); // fallback
                             console.log(`[Discordlate] Transformed outgoing XHR -> "${englishText}"`);
                             originalSend.call(xhr, JSON.stringify(bodyJson));
                         }).catch(e => {
@@ -174,15 +234,25 @@ const observer = new MutationObserver(mutations => {
                         
                         // Process the message asynchronously
                         (async () => {
-                            if (window.discordlateSentTranslations.has(rawText)) {
+                            const rawText = el.innerText || el.textContent;
+                            if (!rawText || rawText.trim() === '') return;
+                            const matchKey = getMatchKey(rawText);
+                            
+                            if (window.discordlateSentTranslations.has(matchKey) || window.discordlateSentTranslations.has(rawText)) {
                                 // It's an outgoing message that we sent in English
-                                const originalItalian = window.discordlateSentTranslations.get(rawText);
-                                el.innerHTML = `<span style="opacity: 0.7; font-size: 0.85em;">${originalItalian}</span><br><span style="font-size: 1em;"><img src="https://upload.wikimedia.org/wikipedia/commons/d/d7/Google_Translate_logo.svg" style="width: 14px; height: 14px; vertical-align: middle; margin-right: 4px; margin-bottom: 2px;">${rawText}</span>`;
+                                const originalItalian = window.discordlateSentTranslations.get(matchKey) || window.discordlateSentTranslations.get(rawText);
+                                el.innerHTML = `<span style="opacity: 0.7; font-size: 0.85em;">${originalItalian}</span><br><span style="font-size: 1em;"><img src="https://upload.wikimedia.org/wikipedia/commons/d/d7/Google_Translate_logo.svg" style="width: 14px; height: 14px; vertical-align: middle; margin-right: 4px; margin-bottom: 2px;">${el.innerHTML}</span>`;
                             } else {
                                 // It's an incoming message (or ours not translated). Auto-translate.
-                                const translatedToItalian = await translateText(rawText, window.discordlateLangIn);
-                                if (translatedToItalian && translatedToItalian !== rawText) {
-                                    el.innerHTML = `<span style="opacity: 0.7; font-size: 0.85em;">${rawText}</span><br><span style="font-size: 1em;"><img src="https://upload.wikimedia.org/wikipedia/commons/d/d7/Google_Translate_logo.svg" style="width: 14px; height: 14px; vertical-align: middle; margin-right: 4px; margin-bottom: 2px;">${translatedToItalian}</span>`;
+                                const originalHTML = el.innerHTML;
+                                const { textToTranslate, map } = extractIncomingAndMap(el);
+                                if (!textToTranslate || textToTranslate.trim() === '') return;
+                                
+                                const translatedTemp = await translateText(textToTranslate, window.discordlateLangIn);
+                                const restoredHTML = restoreEntities(translatedTemp, map);
+                                
+                                if (restoredHTML && restoredHTML !== originalHTML) {
+                                    el.innerHTML = `<span style="opacity: 0.7; font-size: 0.85em;">${originalHTML}</span><br><span style="font-size: 1em;"><img src="https://upload.wikimedia.org/wikipedia/commons/d/d7/Google_Translate_logo.svg" style="width: 14px; height: 14px; vertical-align: middle; margin-right: 4px; margin-bottom: 2px;">${restoredHTML}</span>`;
                                 }
                             }
                         })().catch(err => console.error("[Discordlate] UI rendering error:", err));
